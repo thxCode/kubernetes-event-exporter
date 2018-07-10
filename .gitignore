@@ -1,0 +1,7 @@
+/.idea
+/vendor
+/bin
+
+.DS_Store
+
+/node_modules

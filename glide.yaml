@@ -1,0 +1,18 @@
+package: github.com/thxcode/kubernetes-event-exporter
+import:
+- package: k8s.io/client-go
+  version: ~8.0.0
+- package: github.com/sirupsen/logrus
+  version: ~1.0.5
+- package: github.com/urfave/cli
+  version: ~1.20.0
+- package: github.com/buger/jsonparser
+- package: github.com/prometheus/common
+- package: k8s.io/api
+- package: github.com/juju/errors
+- package: github.com/mongodb/mongo-go-driver
+  version: ~0.0.8
+- package: github.com/Azure/go-autorest
+  version: ~10.12.0
+- package: github.com/gophercloud/gophercloud
+- package: golang.org/x/oauth2
