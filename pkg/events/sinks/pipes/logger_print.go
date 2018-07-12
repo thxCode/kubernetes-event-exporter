@@ -7,7 +7,6 @@ import (
 
 	apiCoreV1 "k8s.io/api/core/v1"
 	apisMetaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/duration"
 )
 
 const (
@@ -45,7 +44,7 @@ func formatSource(es *apiCoreV1.EventSource) string {
 func formatTimestamp(m *apisMetaV1.Time) string {
 	if m != nil {
 		if !m.IsZero() {
-			return duration.ShortHumanDuration(time.Since(m.Time))
+			return shortHumanDuration(time.Since(m.Time))
 		}
 	}
 
@@ -85,4 +84,21 @@ func printEventList(eventList *apiCoreV1.EventList) string {
 	}
 
 	return builder.String()
+}
+
+func shortHumanDuration(d time.Duration) string {
+	if seconds := int(d.Seconds()); seconds < -1 {
+		return fmt.Sprintf("<invalid>")
+	} else if seconds < 0 {
+		return fmt.Sprintf("0s")
+	} else if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	} else if minutes := int(d.Minutes()); minutes < 60 {
+		return fmt.Sprintf("%dm", minutes)
+	} else if hours := int(d.Hours()); hours < 24 {
+		return fmt.Sprintf("%dh", hours)
+	} else if hours < 24*365 {
+		return fmt.Sprintf("%dd", hours/24)
+	}
+	return fmt.Sprintf("%dy", int(d.Hours()/24/365))
 }

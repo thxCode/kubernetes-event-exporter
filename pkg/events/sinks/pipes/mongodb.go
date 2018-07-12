@@ -4,13 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/juju/errors"
 	"github.com/mongodb/mongo-go-driver/bson"
@@ -18,20 +15,19 @@ import (
 	"github.com/mongodb/mongo-go-driver/mongo"
 	"github.com/sirupsen/logrus"
 	"github.com/thxcode/kubernetes-event-exporter/pkg/events/sinks"
-	"github.com/thxcode/kubernetes-event-exporter/pkg/utils/logger"
+	"github.com/thxcode/kubernetes-event-exporter/pkg/simplelogger"
 	apiCoreV1 "k8s.io/api/core/v1"
 	apisMetaV1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
 const (
-	MongodbConnectURIEnvKey       = "PIPE_MONGODB_CONNECT_URI"
-	MongodbDatabaseNameEnvKey     = "PIPE_MONGODB_DATABASE_NAME"
-	MongodbEnableJsonAttachEnvKey = "PIPE_MONGODB_ENABLE_JSON_ATTACH"
+	MongodbConnectURIEnvKey   = "PIPE_MONGODB_CONNECT_URI"
+	MongodbDatabaseNameEnvKey = "PIPE_MONGODB_DATABASE_NAME"
 
 	dataOpenIdKey     = "_id"
-	dataAttachJsonKey = "_attachJson"
-	dataAttachDocKey  = "_attachDoc"
+	dataAttachPodKey  = "attachPod"
+	dataAttachNodeKey = "attachNode"
 )
 
 type eventChanUnit struct {
@@ -42,16 +38,15 @@ type eventChanUnit struct {
 type mongodbPipe struct {
 	logContext logrus.Fields
 
-	rootCtx        context.Context
-	rootCancelFunc context.CancelFunc
-	eventChan      chan eventChanUnit
-	eventChanStop  chan chan struct{}
-	kclient        kubernetes.Interface
+	ctx           context.Context
+	cancelFunc    context.CancelFunc
+	eventChan     chan eventChanUnit
+	eventChanStop chan chan struct{}
+	kclient       kubernetes.Interface
 
-	mongoCollection  *mongo.Collection
-	mongoDatabase    *mongo.Database
-	mongoClient      *mongo.Client
-	enableJsonAttach bool
+	mongoCollection *mongo.Collection
+	mongoDatabase   *mongo.Database
+	mongoClient     *mongo.Client
 
 	sync.RWMutex
 	sync.Once
@@ -66,13 +61,13 @@ func (p *mongodbPipe) Start() (err error) {
 			err = errors.Errorf(`"%s" env is required`, MongodbConnectURIEnvKey)
 			return
 		} else {
-			enableJsonAttachEnv := os.Getenv(MongodbEnableJsonAttachEnvKey)
-			p.enableJsonAttach = strings.ToLower(enableJsonAttachEnv) == "true"
-			if p.enableJsonAttach {
-				logrus.WithFields(p.logContext).Debugln("enabling Pod or Node info json form attaching")
+			khost := (p.logContext[simplelogger.LogKubernetesHostKey]).(string)
+			if len(khost) == 0 {
+				err = errors.Errorf("can't get Kubernetes host")
+				return
 			}
 
-			p.mongoClient, err = mongo.Connect(p.rootCtx, uri, nil)
+			p.mongoClient, err = mongo.Connect(p.ctx, uri, nil)
 			if err != nil {
 				err = errors.Annotate(err, "MongoDB fail to create client")
 				return
@@ -85,79 +80,11 @@ func (p *mongodbPipe) Start() (err error) {
 			p.mongoDatabase = p.mongoClient.Database(dbname)
 			logrus.WithFields(p.logContext).Debugf("using %s database", dbname)
 
-			khost := (p.logContext[logger.LogKubernetesHostKey]).(string)
-			if len(khost) == 0 {
-				err = errors.Errorf("can't get Kubernetes host")
-				return
-			}
+			clusterID := khost[(strings.LastIndex(khost, "/") + 1):]
+			logrus.WithFields(p.logContext).Debugf("using %s collection", clusterID)
 
-			// get mongodb collection name
-			collectionsMapCollection := p.mongoDatabase.Collection("collections_map")
-			collectionsMapCollection.Indexes().CreateMany(p.rootCtx, nil,
-				mongo.IndexModel{
-					Keys: bson.NewDocument(
-						bson.EC.Int64("kubernetes_host", 1),
-					),
-					Options: bson.NewDocument(
-						bson.EC.Boolean("background", true),
-						bson.EC.Boolean("unique", true),
-						bson.EC.String("name", "khost"),
-					),
-				},
-				mongo.IndexModel{
-					Keys: bson.NewDocument(
-						bson.EC.Int64("collection_name", 1),
-					),
-					Options: bson.NewDocument(
-						bson.EC.Boolean("background", true),
-						bson.EC.Boolean("unique", true),
-						bson.EC.String("name", "colname"),
-					),
-				},
-			)
-
-			docResult := collectionsMapCollection.FindOne(
-				p.rootCtx,
-				bson.NewDocument(
-					bson.EC.String("kubernetes_host", khost),
-				),
-			)
-			colname := ""
-			storageCollectionMap := bson.NewDocument()
-
-			if err := docResult.Decode(storageCollectionMap); err != nil {
-				if err != mongo.ErrNoDocuments {
-					err = errors.Annotatef(err, "can't find info from %s.collections_map collection", dbname)
-					return
-				} else {
-					colname = hashing([]byte(khost))[:16]
-					if _, err = collectionsMapCollection.InsertOne(
-						p.rootCtx,
-						bson.NewDocument(
-							bson.EC.String("kubernetes_host", khost),
-							bson.EC.String("collection_name", colname),
-						),
-					); err != nil {
-						err = errors.Annotatef(err, "can't insert info into %s.collections_map collection", dbname)
-						return
-					}
-				}
-			} else {
-				if colnameVal := storageCollectionMap.Lookup("collection_name"); colnameVal == nil {
-					err = errors.Annotatef(err, "can't find collection_name column on %s.collections_map collection schema", dbname)
-					return
-				} else {
-					colname = colnameVal.StringValue()
-				}
-			}
-
-			if len(colname) == 0 {
-				err = errors.New(fmt.Sprintf("can't use blank collection name for %s", khost))
-				return
-			}
-
-			p.mongoCollection = p.mongoDatabase.Collection(colname)
-			p.mongoCollection.Indexes().CreateMany(p.rootCtx, nil,
+			p.mongoCollection = p.mongoDatabase.Collection(clusterID)
+			p.mongoCollection.Indexes().CreateMany(p.ctx, nil,
 				mongo.IndexModel{
 					Keys: bson.NewDocument(
 						bson.EC.Int64("metadata.uid", 1),
@@ -206,12 +133,37 @@ func (p *mongodbPipe) Stop() {
 	logrus.WithFields(p.logContext).Debugln("stopping")
 
 	<-p.flushEventChan()
-	p.mongoClient.Disconnect(p.rootCtx)
+	p.mongoClient.Disconnect(p.ctx)
 	p.mongoDatabase = nil
 	p.mongoCollection = nil
-	p.rootCancelFunc()
+	p.cancelFunc()
 
 	logrus.WithFields(p.logContext).Debugln("stopped")
+}
+
+func (p *mongodbPipe) doAttachForEvent(kind, namespace, name string, eventLog *HuaWeiEventLogBson) error {
+	switch kind {
+	case "Pod":
+		// scrape Pod info
+		podInfo, err := p.kclient.CoreV1().Pods(namespace).Get(name, apisMetaV1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		eventLog.AttachPod = podInfo
+	case "Node":
+		// scrape Node info
+		nodeInfo, err := p.kclient.CoreV1().Nodes().Get(name, apisMetaV1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		eventLog.AttachNode = nodeInfo
+	default:
+		logrus.WithFields(p.logContext).Debugf("ignoring the addition operation for %s", kind)
+	}
+
+	return nil
 }
 
 func (p *mongodbPipe) OnAdd(event *apiCoreV1.Event) error {
@@ -223,69 +175,27 @@ func (p *mongodbPipe) OnAdd(event *apiCoreV1.Event) error {
 	namespace := involvedObject.Namespace
 	name := involvedObject.Name
 
-	var bufferEventBson *bson.Document
+	var wrapEvent *HuaWeiEventLogBson
 	switch kind {
 	case "Pod":
-		bufferEventBson = eventToBson(event)
-
-		// scrape Pod info
-		podInfo, err := p.kclient.CoreV1().Pods(namespace).Get(name, apisMetaV1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		podInfoJson, err := json.Marshal(podInfo)
-		if err != nil {
-			return err
-		}
-
-		if p.enableJsonAttach {
-			bufferEventBson.Append(
-				bson.EC.String(dataAttachJsonKey, *(*string)(unsafe.Pointer(&podInfoJson))),
-			)
-		} else {
-			podInfoBson, err := bson.ParseExtJSONObject(*(*string)(unsafe.Pointer(&podInfoJson)))
-			if err != nil {
-				return err
-			}
-
-			bufferEventBson.Append(
-				bson.EC.SubDocument(dataAttachDocKey, podInfoBson),
-			)
+		wrapEvent = &HuaWeiEventLogBson{
+			Event: event,
 		}
 	case "Node":
-		bufferEventBson = eventToBson(event)
-
-		// scrape Node info
-		nodeInfo, err := p.kclient.CoreV1().Nodes().Get(name, apisMetaV1.GetOptions{})
-		if err != nil {
-			return err
-		}
-		nodeInfoJson, err := json.Marshal(nodeInfo)
-		if err != nil {
-			return err
-		}
-
-		if p.enableJsonAttach {
-			bufferEventBson.Append(
-				bson.EC.String(dataAttachJsonKey, *(*string)(unsafe.Pointer(&nodeInfoJson))),
-			)
-		} else {
-			nodeInfoBson, err := bson.ParseExtJSONObject(*(*string)(unsafe.Pointer(&nodeInfoJson)))
-			if err != nil {
-				return err
-			}
-
-			bufferEventBson.Append(
-				bson.EC.SubDocument(dataAttachDocKey, nodeInfoBson),
-			)
+		wrapEvent = &HuaWeiEventLogBson{
+			Event: event,
 		}
 	default:
 		logrus.WithFields(p.logContext).Debugf("ignoring the addition operation for %s", kind)
 	}
 
-	if bufferEventBson != nil {
+	if wrapEvent != nil {
+		if err := p.doAttachForEvent(kind, namespace, name, wrapEvent); err != nil {
+			return err
+		}
+
 		p.eventChan <- eventChanUnit{
-			bufferEventBson,
+			wrapEvent.MustMarshalBSONDocument(),
 			sinks.OnAdd,
 		}
 	}
@@ -300,17 +210,19 @@ func (p *mongodbPipe) OnUpdate(_ *apiCoreV1.Event, event *apiCoreV1.Event) error
 	involvedObject := event.InvolvedObject
 	kind := involvedObject.Kind
 
-	var bufferEventBson *bson.Document
+	var wrapEvent *HuaWeiEventLogBson
 	switch kind {
 	case "Pod", "Node":
-		bufferEventBson = eventToBson(event)
+		wrapEvent = &HuaWeiEventLogBson{
+			Event: event,
+		}
 	default:
 		logrus.WithFields(p.logContext).Debugf("ignoring the updating operation for %s", kind)
 	}
 
-	if bufferEventBson != nil {
+	if wrapEvent != nil {
 		p.eventChan <- eventChanUnit{
-			bufferEventBson,
+			wrapEvent.MustMarshalBSONDocument(),
 			sinks.OnUpdate,
 		}
 	}
@@ -332,17 +244,19 @@ func (p *mongodbPipe) OnList(eventList *apiCoreV1.EventList) error {
 		involvedObject := event.InvolvedObject
 		kind := involvedObject.Kind
 
-		var bufferEventBson *bson.Document
+		var wrapEvent *HuaWeiEventLogBson
 		switch kind {
 		case "Pod", "Node":
-			bufferEventBson = eventToBson(&event)
+			wrapEvent = &HuaWeiEventLogBson{
+				Event: &event,
+			}
 		default:
 			logrus.WithFields(p.logContext).Debugf("ignoring the listing operation for %s", kind)
 		}
 
-		if bufferEventBson != nil {
+		if wrapEvent != nil {
 			p.eventChan <- eventChanUnit{
-				bufferEventBson,
+				wrapEvent.MustMarshalBSONDocument(),
 				sinks.OnList,
 			}
 		}
@@ -398,24 +312,22 @@ func (p *mongodbPipe) dealingEvent(unit *eventChanUnit) {
 	}
 
 	eventBson := unit.eventBson
-	metadataUidElement, err := eventBson.LookupElementErr("metadata", "uid")
-	if err != nil {
-		panic(errors.New(`the "metadata.uid" is required`))
-	}
+
+	metadataUidElement := eventBson.LookupElement("metadata", "uid")
 	metadataUid := metadataUidElement.Value().StringValue()
 
 	switch unit.eventHandle {
 	case sinks.OnList:
 		ret := p.mongoCollection.FindOne(
-			p.rootCtx,
+			p.ctx,
 			bson.NewDocument(
 				bson.EC.String("metadata.uid", metadataUid),
 			),
 			option.OptProjection{
 				Projection: bson.NewDocument(
 					bson.EC.Boolean(dataOpenIdKey, false),
-					bson.EC.Boolean(dataAttachJsonKey, false),
-					bson.EC.Boolean(dataAttachDocKey, false),
+					bson.EC.Boolean(dataAttachPodKey, false),
+					bson.EC.Boolean(dataAttachNodeKey, false),
 				),
 			},
 		)
@@ -424,20 +336,31 @@ func (p *mongodbPipe) dealingEvent(unit *eventChanUnit) {
 			if err != mongo.ErrNoDocuments {
 				panic(errors.Annotatef(err, "can't find \n%s", eventBson.ToExtJSON(true)))
 			} else {
-				_, err := p.mongoCollection.InsertOne(
-					p.rootCtx,
-					eventBson,
-				)
-				if err != nil {
-					panic(errors.Annotatef(err, "can't insert \n%s", eventBson.ToExtJSON(true)))
-				} else {
-					logrus.WithFields(p.logContext).Debugln("success add event:", metadataUid)
-				}
+				// // onAdd
+				// involvedObjectKindElement := eventBson.LookupElement("involvedObject", "kind")
+				// involvedObjectKind := involvedObjectKindElement.Value().StringValue()
+				// involvedObjectNamespaceElement := eventBson.LookupElement("involvedObject", "namespace")
+				// involvedObjectNamespace := involvedObjectNamespaceElement.Value().StringValue()
+				// involvedObjectNameElement := eventBson.LookupElement("involvedObject", "name")
+				// involvedObjectName := involvedObjectNameElement.Value().StringValue()
+				//
+				// if err := p.doAttachForEvent(involvedObjectKind, involvedObjectNamespace, involvedObjectName, eventBson); err != nil {
+				// 	panic(errors.Annotatef(err, "can't attach info for \n%s", eventBson.ToExtJSON(true)))
+				// }
+				//
+				// if _, err := p.mongoCollection.InsertOne(
+				// 	p.ctx,
+				// 	eventBson,
+				// ); err != nil {
+				// 	panic(errors.Annotatef(err, "can't insert \n%s", eventBson.ToExtJSON(true)))
+				// } else {
+				// 	logrus.WithFields(p.logContext).Debugln("success add event:", metadataUid)
+				// }
 			}
 		} else {
 			if !inDoc.Equal(eventBson) {
 				_, err := p.mongoCollection.UpdateOne(
-					p.rootCtx,
+					p.ctx,
 					bson.NewDocument(
 						bson.EC.String("metadata.uid", metadataUid),
 					),
@@ -452,7 +375,7 @@ func (p *mongodbPipe) dealingEvent(unit *eventChanUnit) {
 		}
 	case sinks.OnAdd:
 		_, err := p.mongoCollection.InsertOne(
-			p.rootCtx,
+			p.ctx,
 			eventBson,
 		)
 		if err != nil {
@@ -462,7 +385,7 @@ func (p *mongodbPipe) dealingEvent(unit *eventChanUnit) {
 		}
 	case sinks.OnUpdate:
 		ret := p.mongoCollection.FindOneAndUpdate(
-			p.rootCtx,
+			p.ctx,
 			bson.NewDocument(
 				bson.EC.String("metadata.uid", metadataUid),
 			),
@@ -482,16 +405,16 @@ func (p *mongodbPipe) dealingEvent(unit *eventChanUnit) {
 	}
 }
 
-func NewMongoDB(khost string, kclient kubernetes.Interface) *mongodbPipe {
-	ctx, cancelFunc := context.WithCancel(context.Background())
+func NewMongoDB(rootCtx context.Context, khost string, kclient kubernetes.Interface) *mongodbPipe {
+	ctx, cancelFunc := context.WithCancel(rootCtx)
 
 	return &mongodbPipe{
-		logContext: logger.CreateLogContext("PIPE<mongodb>", khost),
+		logContext: simplelogger.CreateLogContext("PIPE<mongodb>", khost),
 
-		rootCtx:        ctx,
-		rootCancelFunc: cancelFunc,
-		eventChan:      make(chan eventChanUnit, 1<<20),
-		eventChanStop:  make(chan chan struct{}),
+		ctx:           ctx,
+		cancelFunc:    cancelFunc,
+		eventChan:     make(chan eventChanUnit, 1<<20),
+		eventChanStop: make(chan chan struct{}),
 
 		kclient: kclient,
 	}

@@ -14,7 +14,7 @@ RUN apk add --no-cache --update \
 
 ## build
 RUN cd $GOPATH/src/github.com/thxcode/kubernetes-event-exporter; \
-    glide install --skip-test; \
+    glide install --skip-test --strip-vendor; \
     $GOPATH/bin/promu build --prefix ./bin; \
     mkdir -p /build; \
     cp -f ./bin/kubernetes-event-exporter /build/

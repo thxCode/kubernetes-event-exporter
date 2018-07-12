@@ -4,7 +4,7 @@ import (
 	"sync"
 
 	"github.com/sirupsen/logrus"
-	"github.com/thxcode/kubernetes-event-exporter/pkg/utils/logger"
+	"github.com/thxcode/kubernetes-event-exporter/pkg/simplelogger"
 	apiCoreV1 "k8s.io/api/core/v1"
 )
 
@@ -54,6 +54,6 @@ func (p *loggerPipe) OnList(eventList *apiCoreV1.EventList) error {
 
 func NewLogger(khost string) *loggerPipe {
 	return &loggerPipe{
-		logContext: logger.CreateLogContext("PIPE<logger>", khost),
+		logContext: simplelogger.CreateLogContext("PIPE<logger>", khost),
 	}
 }

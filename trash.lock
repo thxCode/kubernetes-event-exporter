@@ -1,0 +1,5 @@
+package: github.com/thxcode/kubernetes-event-exporter
+import:
+- package: github.com/rancher/types
+  version: c7d2064d4e81c4d43beb6c3aa0299e74015fcecc
+  repo: https://github.com/thxcode/types

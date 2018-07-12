@@ -1,39 +1,32 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
-	"os/signal"
 	"strings"
 	"time"
 
+	"github.com/juju/errors"
+	normanLeader "github.com/rancher/norman/leader"
+	normanSignal "github.com/rancher/norman/signal"
 	"github.com/sirupsen/logrus"
 	"github.com/thxcode/kubernetes-event-exporter/pkg/events/sinks/pipes"
-	"github.com/thxcode/kubernetes-event-exporter/pkg/utils/logger"
+	"github.com/thxcode/kubernetes-event-exporter/pkg/exporters"
+	"github.com/thxcode/kubernetes-event-exporter/pkg/simplelogger"
+	"github.com/thxcode/kubernetes-event-exporter/server"
 	"github.com/urfave/cli"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
-
-	"github.com/prometheus/common/version"
-
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	k8sRest "k8s.io/client-go/rest"
+	k8sClientcmd "k8s.io/client-go/tools/clientcmd"
+
+	exporterApiContext "github.com/thxcode/kubernetes-event-exporter/pkg/api/context"
+	huaweiControllers "github.com/thxcode/kubernetes-event-exporter/pkg/controllers/huawei"
 )
 
-func newSystemStopChannel() chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		c := make(chan os.Signal)
-		signal.Notify(c, os.Interrupt, os.Kill)
-		sig := <-c
-		logrus.Debugf("recieved signal %s, terminating", sig.String())
-
-		close(ch)
-	}()
-
-	return ch
-}
+var (
+	Version = "dev"
+)
 
 func initLog(c *cli.Context) {
 	switch strings.ToLower(c.String("log-level")) {
@@ -55,7 +48,7 @@ func initLog(c *cli.Context) {
 	case "json":
 		logrus.SetFormatter(&logrus.JSONFormatter{})
 	default:
-		logrus.SetFormatter(logger.NewSimpleFormatter())
+		logrus.SetFormatter(simplelogger.NewSimpleFormatter())
 	}
 
 	logrus.SetOutput(os.Stdout)
@@ -64,16 +57,20 @@ func initLog(c *cli.Context) {
 func main() {
 	app := cli.NewApp()
 	app.Name = "kubernetes-event-exporter"
-	app.Version = version.Print("kubernetes-event-exporter")
+	app.Version = Version
 	app.Usage = "An exporter exposes events of Kubernetes."
 	app.Action = appAction
 
 	app.Flags = []cli.Flag{
-		cli.StringSliceFlag{
-			Name:   "kubeconfig",
-			Usage:  "kube config for accessing Kubernetes cluster",
-			EnvVar: "KUBECONFIG",
-			Value:  &cli.StringSlice{},
+		cli.IntFlag{
+			Name:  "http-listen-port",
+			Usage: "HTTP listen port",
+			Value: 8080,
+		},
+		cli.IntFlag{
+			Name:  "https-listen-port",
+			Usage: "HTTPS listen port",
+			Value: 8443,
 		},
 		cli.StringFlag{
 			Name:   "log-level",
@@ -86,6 +83,11 @@ func main() {
 			Usage:  "log formatter used (json, text, simple) for logrus",
 			EnvVar: "LOG_FORMAT",
 			Value:  "simple",
+		},
+		cli.StringFlag{
+			Name:   "kubeconfig",
+			Usage:  "kube config for accessing Kubernetes cluster",
+			EnvVar: "KUBECONFIG",
 		},
 		cli.DurationFlag{
 			Name:   "resync-period",
@@ -103,8 +105,8 @@ func main() {
 			Name: "use-pipe",
 			Usage: fmt.Sprintf(`pipes for sink using:
 			1. [logger] pipe is DEBUG logrus;
-			2. [mongodb] pipe uses %s, %s and %s envs`,
-				pipes.MongodbConnectURIEnvKey, pipes.MongodbDatabaseNameEnvKey, pipes.MongodbEnableJsonAttachEnvKey),
+			2. [mongodb] pipe uses %s, %s envs`,
+				pipes.MongodbConnectURIEnvKey, pipes.MongodbDatabaseNameEnvKey),
 			EnvVar: "USE_PIPE",
 			Value:  &cli.StringSlice{},
 		},
@@ -113,69 +115,92 @@ func main() {
 			Usage:  "enable the pipes parallel",
 			EnvVar: "PIPES_PARALLEL",
 		},
+		cli.DurationFlag{
+			Name:   "termination-grace-period",
+			Usage:  "period for termination",
+			EnvVar: "TERMINATION_GRACE_PERIOD",
+			Value:  1 * time.Minute,
+		},
 	}
 
 	app.Run(os.Args)
 }
 
-func appAction(c *cli.Context) {
-	var (
-		resyncPeriod  = c.Duration("resync-period")
-		storageTTL    = c.Duration("storage-ttl")
-		kubeconfigs   = c.StringSlice("kubeconfig")
-		usePipes      = c.StringSlice("use-pipe")
-		pipesParallel = c.Bool("pipes-parallel")
-
-		stopChan = newSystemStopChannel()
-		g        = &wait.Group{}
-		kconfigs []*rest.Config
-	)
-
+func appAction(c *cli.Context) error {
 	initLog(c)
 
-	if len(kubeconfigs) == 0 {
-		kconfig, err := rest.InClusterConfig()
+	rootCtx := normanSignal.SigTermCancelContext(context.Background())
+
+	var (
+		kubeconfig = c.String("kubeconfig")
+		kconfig    *k8sRest.Config
+	)
+
+	if len(kubeconfig) == 0 {
+		config, err := k8sRest.InClusterConfig()
 		if err != nil {
-			logrus.WithError(err).Fatalln("failed to create Kubernetes config from in-cluster")
+			return errors.Annotatef(err, "failed to create Kubernetes config from in-cluster")
 		}
 
-		kconfigs = append(kconfigs, kconfig)
+		kconfig = config
 	} else {
-		for _, kconfigPath := range kubeconfigs {
-			if len(kconfigPath) != 0 {
-				if _, err := os.Stat(kconfigPath); err != nil {
-					logrus.WithError(err).Fatalln("can't open", kconfigPath)
-				} else {
-					kconfig, err := clientcmd.BuildConfigFromFlags("", kconfigPath)
-					if err != nil {
-						logrus.WithError(err).Fatalln("failed to create Kubernetes config from", kconfigPath)
-					}
-
-					kconfigs = append(kconfigs, kconfig)
-				}
+		if _, err := os.Stat(kubeconfig); err != nil {
+			logrus.WithError(err).Fatalln("can't open", kubeconfig)
+		} else {
+			config, err := k8sClientcmd.BuildConfigFromFlags("", kubeconfig)
+			if err != nil {
+				return errors.Annotatef(err, "failed to create Kubernetes config from", kubeconfig)
 			}
+
+			kconfig = config
 		}
 	}
 
-	for _, kconfig := range kconfigs {
-		khost := kconfig.Host
-		kclient, err := kubernetes.NewForConfig(kconfig)
+	os.Unsetenv("KUBECONFIG")
+
+	return appRun(rootCtx, kconfig, c.Int("http-listen-port"), c.Int("https-listen-port"), c.Duration("termination-grace-period"), &exporters.EventExporterConfig{
+		ResyncPeriod:  c.Duration("resync-period"),
+		StorageTTL:    c.Duration("storage-ttl"),
+		UsePipes:      c.StringSlice("use-pipe"),
+		PipesParallel: c.Bool("pipes-parallel"),
+	})
+}
+
+func appRun(rootCtx context.Context, rancherBackendK8sConfig *k8sRest.Config, httpPort, httpsPort int, terminationGracePeriod time.Duration, eventExportConfigTemplate *exporters.EventExporterConfig) error {
+	mgrContext, err := exporterApiContext.BuildScaledContext(rootCtx, rancherBackendK8sConfig, httpsPort)
+	if err != nil {
+		return errors.Annotate(err, "can't build scaled context")
+	}
+
+	if err := server.Start(rootCtx, httpPort, httpsPort, mgrContext); err != nil {
+		return errors.Annotate(err, "can't start API schemas server")
+	}
+
+	stoppingChan := make(chan struct{})
+	go normanLeader.RunOrDie(rootCtx, "huawei-event-controllers", mgrContext.K8sClient, func(ctx context.Context) {
+		mgrContext.Leader = true
+
+		ctx = context.WithValue(ctx, "stoppingChan", stoppingChan)
+		huaweiControllers.Register(ctx, mgrContext, eventExportConfigTemplate)
+		err := mgrContext.Start(ctx)
 		if err != nil {
-			logrus.WithError(err).Fatalf("failed to create Kubernetes client for %s", khost)
+			panic(errors.Annotate(err, "can't start scaled context"))
 		}
 
-		g.StartWithChannel(
-			stopChan,
-			newEventExporter(
-				kclient,
-				khost,
-				resyncPeriod,
-				storageTTL,
-				usePipes,
-				pipesParallel,
-			).Run,
-		)
+		logrus.Infof("Huawei event controllers startup complete")
+
+		<-ctx.Done()
+	})
+
+	logrus.Infoln("running")
+	<-rootCtx.Done()
+	logrus.Infoln("stopping")
+	select {
+	case <-time.Tick(terminationGracePeriod):
+		logrus.Warnln("stopped with timeout")
+	case <-stoppingChan:
+		logrus.Infoln("stopped")
 	}
 
-	g.Wait()
+	return rootCtx.Err()
 }

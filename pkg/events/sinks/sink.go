@@ -7,7 +7,7 @@ import (
 	"github.com/juju/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/thxcode/kubernetes-event-exporter/pkg/events"
-	"github.com/thxcode/kubernetes-event-exporter/pkg/utils/logger"
+	"github.com/thxcode/kubernetes-event-exporter/pkg/simplelogger"
 	apiCoreV1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 )
@@ -173,7 +173,7 @@ func NewDefaultSink(config *DefaultSinkConfig) (*DefaultSink, error) {
 	}
 
 	return &DefaultSink{
-		logContext:      logger.CreateLogContext("SINK", config.KubernetesHost),
+		logContext:      simplelogger.CreateLogContext("SINK", config.KubernetesHost),
 		pipesMap:        pipesMap,
 		isPipesParallel: config.PipesParallel,
 	}, nil
